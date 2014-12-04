@@ -243,6 +243,7 @@ struct ngx_http_upstream_check_srv_conf_s {
     ngx_uint_t                               fastcgi_params_count;
     ngx_str_t                               *fastcgi_send;
     ngx_str_t                                fastcgi_path_translated;
+    size_t                                   check_off_limit;
 
     ngx_uint_t                               default_down;
 };
@@ -586,6 +587,13 @@ static ngx_command_t  ngx_http_upstream_check_commands[] = {
       ngx_http_upstream_check_status,
       0,
       0,
+      NULL },
+
+    { ngx_string("check_off_limit"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_upstream_check_srv_conf_t, check_off_limit),
       NULL },
 
       ngx_null_command
@@ -2623,12 +2631,14 @@ ngx_http_upstream_check_ajp_reinit(ngx_http_upstream_check_peer_t *peer)
     ctx->recv.pos = ctx->recv.last = ctx->recv.start;
 }
 
-
 static void
-ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer,
-    ngx_int_t result)
+ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer, ngx_int_t result)
 {
-    ngx_http_upstream_check_srv_conf_t  *ucscf;
+    ngx_http_upstream_check_peer_t       *cpeer;
+    ngx_http_upstream_check_peers_t      *peers;
+    ngx_http_upstream_check_srv_conf_t   *ucscf;
+    ngx_uint_t total_peer_count, down_peer_count, down_percent, i;
+    u_char down_allowed;
 
     ucscf = peer->conf;
 
@@ -2637,24 +2647,50 @@ ngx_http_upstream_check_status_update(ngx_http_upstream_check_peer_t *peer,
         peer->shm->fall_count = 0;
         if (peer->shm->down && peer->shm->rise_count >= ucscf->rise_count) {
             peer->shm->down = 0;
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "enable check peer: %V ",
-                          &peer->check_peer_addr->name);
         }
+
     } else {
         peer->shm->rise_count = 0;
         peer->shm->fall_count++;
         if (!peer->shm->down && peer->shm->fall_count >= ucscf->fall_count) {
-            peer->shm->down = 1;
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "disable check peer: %V ",
-                          &peer->check_peer_addr->name);
+            down_allowed = (ucscf->check_off_limit >= 100 || check_peers_ctx == NULL);
+            if (!down_allowed) {
+                peers = check_peers_ctx;
+                total_peer_count = 0;
+                down_peer_count = 0;
+                cpeer = peers->peers.elts;
+                for (i = 0; i < peers->peers.nelts; i++) {
+                    if (
+                        peer->upstream_name->len == cpeer[i].upstream_name->len
+                        && ngx_strncmp(peer->upstream_name->data, cpeer[i].upstream_name->data, peer->upstream_name->len) == 0
+                    ) {
+                        total_peer_count += 1;
+                        if (cpeer[i].shm->down) {
+                            down_peer_count += 1;
+                        }
+                    }
+                }
+
+                down_percent = (down_peer_count * 100) / total_peer_count;
+                down_allowed = (down_percent < ucscf->check_off_limit);
+                if (!down_allowed) {
+                    ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                        "upstream_check_module: peer down is disabled by percentage (peer: %V, limit: %ul, current: %ui)",
+                        &peer->peer_addr->name,
+                        ucscf->check_off_limit,
+                        down_percent
+                    );
+                }
+            }
+
+            if (down_allowed) {
+                peer->shm->down = 1;
+            }
         }
     }
 
     peer->shm->access_time = ngx_current_msec;
 }
-
 
 static void
 ngx_http_upstream_check_clean_event(ngx_http_upstream_check_peer_t *peer)
@@ -3777,6 +3813,7 @@ ngx_http_upstream_check_create_srv_conf(ngx_conf_t *cf)
     ucscf->check_timeout = NGX_CONF_UNSET_MSEC;
     ucscf->check_keepalive_requests = NGX_CONF_UNSET_UINT;
     ucscf->check_type_conf = NGX_CONF_UNSET_PTR;
+    ucscf->check_off_limit = NGX_CONF_UNSET_SIZE;
 
     return ucscf;
 }
